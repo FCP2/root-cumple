@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: wa-bot-free
+    runtime: node
+    plan: free
+    autoDeploy: true
+    buildCommand: "npm ci"
+    startCommand: "npm start"
+    disk:
+      name: wa-session
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: TZ
+        value: America/Mexico_City
+      - key: AUTH_DIR
+        value: /data/baileys
+      # ======= Google Sheets =======
+      - key: GCP_CREDENTIALS_JSON
+        sync: false
+      - key: SHEET_KEY
+        value: "10jnzgMiG-kisw-CFWwZhKOCnkO0TjPXtif23D3-GNz0"            # ID del Google Sheet
+      - key: WORKSHEET_NAME
+        value: "Sheet1"
+      # ======= Envíos =======
+      - key: DEST_NUMBERS
+        value: "5217292251844"
+      - key: SEND_MODE
+        value: "today"       # today | until_today
