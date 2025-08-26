@@ -1,5 +1,5 @@
 import express from "express";
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@adiwajshing/baileys";
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
 import pino from "pino";
 import QRCode from "qrcode";
 import dayjs from "dayjs";
