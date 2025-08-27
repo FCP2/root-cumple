@@ -146,19 +146,44 @@ app.get("/", (req, res) => {
     <html>
       <head>
         <meta charset="utf-8"/>
-        <meta http-equiv="cache-control" content="no-store" />
-        <style>body{font-family:system-ui;padding:24px}</style>
+        <style>
+          body{font-family:system-ui;padding:24px}
+          #qr{max-width:360px;border:1px solid #ccc;display:none}
+          #msg{margin-top:12px;color:#444}
+        </style>
       </head>
       <body>
         <h2>Vincula tu WhatsApp (escanea el QR)</h2>
-        <p>El QR se actualiza automáticamente cada 5s.</p>
-        <img id="qr" src="/qr.png?t=${Date.now()}" alt="QR" style="max-width:360px;border:1px solid #ccc"/>
+        <p id="msg">Esperando QR válido…</p>
+        <img id="qr" src="" alt="QR"/>
         <p><a href="/status" target="_blank">/status</a></p>
         <script>
-          setInterval(() => {
-            const img = document.getElementById('qr');
-            img.src = '/qr.png?t=' + Date.now();
-          }, 5000);
+          async function refreshQR(){
+            try{
+              const r = await fetch('/qr.png?t=' + Date.now(), { cache: 'no-store' });
+              const img = document.getElementById('qr');
+              const msg = document.getElementById('msg');
+
+              if (r.status === 200) {
+                const blob = await r.blob();
+                img.src = URL.createObjectURL(blob);
+                img.style.display = 'block';
+                msg.textContent = 'Escanea el QR (cambia cada ~20s)…';
+              } else if (r.status === 204) {
+                // No hay QR vigente aún
+                img.style.display = 'none';
+                msg.textContent = 'Esperando QR válido…';
+              } else {
+                img.style.display = 'none';
+                msg.textContent = 'Error cargando QR. Reintentando…';
+              }
+            } catch(e){
+              document.getElementById('qr').style.display = 'none';
+              document.getElementById('msg').textContent = 'Error de red. Reintentando…';
+            }
+          }
+          refreshQR();
+          setInterval(refreshQR, 3000); // cada 3s para agarrar el próximo QR fresco
         </script>
       </body>
     </html>
@@ -172,14 +197,12 @@ app.get("/qr.png", async (req, res) => {
     res.set("Expires", "0");
     res.set("Surrogate-Control", "no-store");
 
-    if (!lastQR) {
-      const png = await QRCode.toBuffer("Esperando QR…");
-      return res.type("png").send(png);
+    if (!hasFreshQR()) {
+      // ⚠️ No hay QR vigente: devolvemos 204 (No Content) para que el frontend NO muestre un QR falso
+      return res.status(204).end();
     }
-    if (Date.now() - lastQRAt > 25_000) {
-      const png = await QRCode.toBuffer("QR expirado, espera uno nuevo…");
-      return res.type("png").send(png);
-    }
+
+    // ✅ Hay QR vigente: renderízalo bien (360 px)
     const png = await QRCode.toBuffer(lastQR, { margin: 1, width: 360 });
     return res.type("png").send(png);
   } catch (e) {
