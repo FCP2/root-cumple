@@ -4,7 +4,6 @@ import pino from "pino";
 import QRCode from "qrcode";
 import dayjs from "dayjs";
 import "dayjs/locale/es.js";
-
 import { google } from "googleapis";
 
 dayjs.locale("es");
@@ -19,16 +18,17 @@ const DEST_NUMBERS = (process.env.DEST_NUMBERS || "")
 const SEND_MODE = (process.env.SEND_MODE || "today").toLowerCase(); // today | until_today
 const CREDS_JSON = process.env.GCP_CREDENTIALS_JSON;
 
-if (!SHEET_KEY) console.warn("⚠️ Falta SHEET_KEY");
-if (!CREDS_JSON) console.warn("⚠️ Falta GCP_CREDENTIALS_JSON");
+if (!SHEET_KEY) console.warn("⚠️ Falta SHEET_KEY (ID de tu Google Sheet).");
+if (!CREDS_JSON) console.warn("⚠️ Falta GCP_CREDENTIALS_JSON (JSON de cuenta de servicio).");
 
 // ========= App & estado =========
 const app = express();
 app.use(express.json());
 
 let sock = null;
-let lastQR = "";     // string del QR en texto
 let connReady = false;
+let lastQR = "";     // texto del QR
+let lastQRAt = 0;    // epoch ms del último QR recibido
 
 // ========= Google Sheets helpers =========
 function getSheetsClient() {
@@ -44,7 +44,6 @@ function getSheetsClient() {
 }
 
 function colToA1(colIndex) {
-  // 1->A, 2->B...
   let s = "";
   let n = colIndex;
   while (n > 0) {
@@ -64,10 +63,7 @@ async function readRows() {
   });
   const values = res.data.values || [];
   if (values.length === 0) return { headers: [], rows: [] };
-
-  const headers = values[0];
-  const rows = values.slice(1);
-  return { headers, rows };
+  return { headers: values[0], rows: values.slice(1) };
 }
 
 async function updateCell(rowIndex1, colIndex1, value) {
@@ -85,27 +81,23 @@ async function updateCell(rowIndex1, colIndex1, value) {
 function parseDDMMYY(s) {
   if (!s) return null;
   const t = s.toString().trim();
-  // Soporta dd/mm/yy o dd/mm/yyyy
-  const [d, m, y] = t.split("/");
-  if (!d || !m || !y) return null;
+  const parts = t.split("/");
+  if (parts.length < 3) return null;
+  const [d, m, y] = parts;
   const year = y.length === 2 ? (2000 + parseInt(y, 10)) : parseInt(y, 10);
   const date = dayjs(`${year}-${m}-${d}`, "YYYY-M-D", true);
   return date.isValid() ? date : null;
 }
 
-function todayMX() {
-  return dayjs().tz ? dayjs().tz("America/Mexico_City") : dayjs();
-}
-
 // ========= Baileys (WhatsApp) =========
 async function startWA() {
-  const logger = pino({ level: "silent" }); // baja logs
+  const logger = pino({ level: "silent" });
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
+    printQRInTerminal: false, // lo mostramos por /qr.png
     logger
   });
 
@@ -116,6 +108,7 @@ async function startWA() {
 
     if (qr) {
       lastQR = qr;
+      lastQRAt = Date.now();
       connReady = false;
       console.log("QR recibido (escanea en /qr.png)");
     }
@@ -123,6 +116,7 @@ async function startWA() {
     if (connection === "open") {
       connReady = true;
       lastQR = "";
+      lastQRAt = 0;
       console.log("✅ WhatsApp conectado");
     } else if (connection === "close") {
       const shouldReconnect =
@@ -135,8 +129,7 @@ async function startWA() {
 }
 
 async function sendText(toNumber, message) {
-  if (!sock || !connReady) throw new Error("WhatsApp no está listo (escanea QR).");
-  // Asegura formato internacional (ej. 521XXXXXXXXXX@s.whatsapp.net)
+  if (!sock || !connReady) throw new Error("WhatsApp no está listo (escanea el QR en /).");
   const jid = toNumber.includes("@s.whatsapp.net")
     ? toNumber
     : `${toNumber}@s.whatsapp.net`;
@@ -145,43 +138,61 @@ async function sendText(toNumber, message) {
 
 // ========= Rutas =========
 app.get("/", (req, res) => {
+  res.set("Cache-Control", "no-store");
   if (connReady) {
-    res.send("✅ Sesión lista. Endpoints: /status, /qr.png, /preview, /send_pending, /send_test");
-  } else {
-    res.setHeader("Refresh", "8");
-    res.send(`
-      <html>
-        <head><meta charset="utf-8"></head>
-        <body style="font-family: system-ui; padding: 24px;">
-          <h2>Vincula tu WhatsApp (escanea el QR)</h2>
-          <p>La página se actualiza cada 8s.</p>
-          <img src="/qr.png" alt="QR" style="max-width: 360px; border: 1px solid #ccc"/>
-          <p><a href="/status" target="_blank">/status</a></p>
-        </body>
-      </html>
-    `);
+    return res.send("✅ Sesión lista. Endpoints: /status, /qr.png, /preview, /send_pending, /send_test");
   }
+  return res.send(`
+    <html>
+      <head>
+        <meta charset="utf-8"/>
+        <meta http-equiv="cache-control" content="no-store" />
+        <style>body{font-family:system-ui;padding:24px}</style>
+      </head>
+      <body>
+        <h2>Vincula tu WhatsApp (escanea el QR)</h2>
+        <p>El QR se actualiza automáticamente cada 5s.</p>
+        <img id="qr" src="/qr.png?t=${Date.now()}" alt="QR" style="max-width:360px;border:1px solid #ccc"/>
+        <p><a href="/status" target="_blank">/status</a></p>
+        <script>
+          setInterval(() => {
+            const img = document.getElementById('qr');
+            img.src = '/qr.png?t=' + Date.now();
+          }, 5000);
+        </script>
+      </body>
+    </html>
+  `);
 });
 
 app.get("/qr.png", async (req, res) => {
   try {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    res.set("Surrogate-Control", "no-store");
+
     if (!lastQR) {
-      // Si ya está conectado o aún no hay QR
-      const empty = await QRCode.toBuffer("Sesión lista o QR no disponible");
-      res.type("png").send(empty);
-      return;
+      const png = await QRCode.toBuffer("Esperando QR…");
+      return res.type("png").send(png);
+    }
+    if (Date.now() - lastQRAt > 25_000) {
+      const png = await QRCode.toBuffer("QR expirado, espera uno nuevo…");
+      return res.type("png").send(png);
     }
     const png = await QRCode.toBuffer(lastQR, { margin: 1, width: 360 });
-    res.type("png").send(png);
+    return res.type("png").send(png);
   } catch (e) {
-    res.status(500).send("QR error");
+    return res.status(500).send("QR error");
   }
 });
 
 app.get("/status", async (req, res) => {
+  res.set("Cache-Control", "no-store");
   res.json({
     connected: connReady,
     hasQR: !!lastQR,
+    qrAgeMs: lastQRAt ? (Date.now() - lastQRAt) : null,
     sheetKey: !!SHEET_KEY,
     worksheet: WORKSHEET_NAME,
     destNumbers: DEST_NUMBERS.length,
@@ -241,7 +252,7 @@ app.get("/preview", async (req, res) => {
       }
     });
 
-    res.json({ today: today.format("YYYY-MM-DD"), mode: SEND_MODE, to_send: pending });
+    res.json({ today: dayjs().format("YYYY-MM-DD"), mode: SEND_MODE, to_send: pending });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -250,6 +261,7 @@ app.get("/preview", async (req, res) => {
 app.all("/send_pending", async (req, res) => {
   try {
     if (!DEST_NUMBERS.length) return res.status(400).json({ error: "Configura DEST_NUMBERS" });
+
     const { headers, rows } = await readRows();
     const hmap = Object.fromEntries(headers.map((h, i) => [h.trim().toLowerCase(), i]));
     const iNombre = hmap["nombre"];
@@ -278,14 +290,11 @@ app.all("/send_pending", async (req, res) => {
       if (!cond) continue;
 
       const msg = `🎉 *Recordatorio*\n- Nombre: ${nombre}\n- Cargo: ${cargo}\n- Fecha: ${fecha.format("DD/MM/YYYY")}`;
-      // envía a todos los destinatarios
       for (const num of DEST_NUMBERS) {
         await sendText(num, msg);
-        await new Promise(r => setTimeout(r, 600)); // pequeña pausa
+        await new Promise(r => setTimeout(r, 600));
       }
-      // marca Enviado = "sí" (columna iEnviado -> index 0-based, en A1 es colIndex1 = iEnviado+1)
       await updateCell(r, iEnviado + 1, "sí");
-
       sent.push({ row: r, Nombre: nombre });
       await new Promise(r => setTimeout(r, 400));
     }
