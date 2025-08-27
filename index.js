@@ -1,4 +1,5 @@
 import express from "express";
+import fs from "fs";
 import makeWASocket, { useMultiFileAuthState, DisconnectReason } from "@whiskeysockets/baileys";
 import pino from "pino";
 import QRCode from "qrcode";
@@ -8,7 +9,7 @@ import { google } from "googleapis";
 
 dayjs.locale("es");
 
-// ========= ENV =========
+/* ========= ENV ========= */
 const PORT = process.env.PORT || 10000;
 const AUTH_DIR = process.env.AUTH_DIR || "/data/baileys";
 const SHEET_KEY = (process.env.SHEET_KEY || "").trim();
@@ -21,16 +22,24 @@ const CREDS_JSON = process.env.GCP_CREDENTIALS_JSON;
 if (!SHEET_KEY) console.warn("⚠️ Falta SHEET_KEY (ID de tu Google Sheet).");
 if (!CREDS_JSON) console.warn("⚠️ Falta GCP_CREDENTIALS_JSON (JSON de cuenta de servicio).");
 
-// ========= App & estado =========
+/* ========= Estado global ========= */
 const app = express();
 app.use(express.json());
 
 let sock = null;
 let connReady = false;
-let lastQR = "";     // texto del QR
-let lastQRAt = 0;    // epoch ms del último QR recibido
 
-// ========= Google Sheets helpers =========
+let lastQR = "";      // string QR real de Baileys
+let lastQRAt = 0;     // epoch ms del último QR recibido
+let lastQrError = null;
+
+fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+function hasFreshQR() {
+  return !!lastQR && (Date.now() - lastQRAt) <= 25000; // QR válido ~25s
+}
+
+/* ========= Google Sheets helpers ========= */
 function getSheetsClient() {
   if (!CREDS_JSON) throw new Error("Falta GCP_CREDENTIALS_JSON");
   const info = JSON.parse(CREDS_JSON);
@@ -77,7 +86,7 @@ async function updateCell(rowIndex1, colIndex1, value) {
   });
 }
 
-// ========= Fechas =========
+/* ========= Fechas ========= */
 function parseDDMMYY(s) {
   if (!s) return null;
   const t = s.toString().trim();
@@ -89,23 +98,20 @@ function parseDDMMYY(s) {
   return date.isValid() ? date : null;
 }
 
-// ========= Baileys (WhatsApp) =========
+/* ========= Baileys (WhatsApp) ========= */
 async function startWA() {
   const logger = pino({ level: "silent" });
-
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // lo mostramos por /qr.png
+    printQRInTerminal: false,
     logger
   });
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
+  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       lastQR = qr;
       lastQRAt = Date.now();
@@ -121,8 +127,8 @@ async function startWA() {
     } else if (connection === "close") {
       const shouldReconnect =
         (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
-      console.log("Conexión cerrada. Reintentar:", shouldReconnect);
       connReady = false;
+      console.log("Conexión cerrada. Reintentar:", shouldReconnect);
       if (shouldReconnect) startWA().catch(console.error);
     }
   });
@@ -136,7 +142,7 @@ async function sendText(toNumber, message) {
   await sock.sendMessage(jid, { text: message });
 }
 
-// ========= Rutas =========
+/* ========= Rutas ========= */
 app.get("/", (req, res) => {
   res.set("Cache-Control", "no-store");
   if (connReady) {
@@ -156,7 +162,7 @@ app.get("/", (req, res) => {
         <h2>Vincula tu WhatsApp (escanea el QR)</h2>
         <p id="msg">Esperando QR válido…</p>
         <img id="qr" src="" alt="QR"/>
-        <p><a href="/status" target="_blank">/status</a></p>
+        <p><a href="/status" target="_blank">/status</a> — <a href="/debug_qr" target="_blank">/debug_qr</a></p>
         <script>
           async function refreshQR(){
             try{
@@ -170,7 +176,6 @@ app.get("/", (req, res) => {
                 img.style.display = 'block';
                 msg.textContent = 'Escanea el QR (cambia cada ~20s)…';
               } else if (r.status === 204) {
-                // No hay QR vigente aún
                 img.style.display = 'none';
                 msg.textContent = 'Esperando QR válido…';
               } else {
@@ -183,7 +188,7 @@ app.get("/", (req, res) => {
             }
           }
           refreshQR();
-          setInterval(refreshQR, 3000); // cada 3s para agarrar el próximo QR fresco
+          setInterval(refreshQR, 3000); // cada 3s para captar el próximo QR fresco
         </script>
       </body>
     </html>
@@ -197,29 +202,44 @@ app.get("/qr.png", async (req, res) => {
     res.set("Expires", "0");
     res.set("Surrogate-Control", "no-store");
 
+    lastQrError = null;
+
+    // Solo devolvemos imagen si el QR es real y está fresco
     if (!hasFreshQR()) {
-      // ⚠️ No hay QR vigente: devolvemos 204 (No Content) para que el frontend NO muestre un QR falso
       return res.status(204).end();
     }
 
-    // ✅ Hay QR vigente: renderízalo bien (360 px)
     const png = await QRCode.toBuffer(lastQR, { margin: 1, width: 360 });
     return res.type("png").send(png);
   } catch (e) {
-    return res.status(500).send("QR error");
+    lastQrError = String(e?.message || e);
+    console.error("QR render error:", e);
+    res.status(500).send("QR render error");
   }
 });
 
-app.get("/status", async (req, res) => {
+app.get("/status", (req, res) => {
   res.set("Cache-Control", "no-store");
   res.json({
     connected: connReady,
-    hasQR: !!lastQR,
+    hasFreshQR: hasFreshQR(),
     qrAgeMs: lastQRAt ? (Date.now() - lastQRAt) : null,
+    qrSample: lastQR ? lastQR.slice(0, 24) + "..." : null,
+    lastQrError,
     sheetKey: !!SHEET_KEY,
     worksheet: WORKSHEET_NAME,
     destNumbers: DEST_NUMBERS.length,
     sendMode: SEND_MODE
+  });
+});
+
+app.get("/debug_qr", (req, res) => {
+  res.json({
+    hasQR: !!lastQR,
+    hasFreshQR: hasFreshQR(),
+    qrLen: lastQR ? lastQR.length : 0,
+    qrAgeMs: lastQRAt ? (Date.now() - lastQRAt) : null,
+    lastQrError
   });
 });
 
@@ -328,7 +348,7 @@ app.all("/send_pending", async (req, res) => {
   }
 });
 
-// ========= Arranque =========
+/* ========= Arranque ========= */
 app.listen(PORT, async () => {
   console.log("HTTP on 0.0.0.0:" + PORT);
   try {
